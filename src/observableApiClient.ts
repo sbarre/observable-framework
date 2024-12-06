@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
+import type {BuildManifest} from "./build.js";
+import type {ClackEffects} from "./clack.js";
 import {CliError, HttpError, isApiError} from "./error.js";
+import {formatByteSize} from "./format.js";
 import type {ApiKey} from "./observableApiConfig.js";
 import {faint, red} from "./tty.js";
+
+const MIN_RATE_LIMIT_RETRY_AFTER = 1;
 
 export function getObservableUiOrigin(env = process.env): URL {
   const urlText = env["OBSERVABLE_ORIGIN"] ?? "https://observablehq.com";
@@ -27,17 +32,26 @@ export function getObservableApiOrigin(env = process.env): URL {
   return uiOrigin;
 }
 
+export type ObservableApiClientOptions = {
+  apiOrigin?: URL;
+  apiKey?: ApiKey;
+  clack: ClackEffects;
+};
+
 export class ObservableApiClient {
   private _apiHeaders: Record<string, string>;
   private _apiOrigin: URL;
+  private _clack: ClackEffects;
+  private _rateLimit: null | Promise<void> = null;
 
-  constructor({apiKey, apiOrigin = getObservableApiOrigin()}: {apiOrigin?: URL; apiKey?: ApiKey} = {}) {
+  constructor({apiKey, apiOrigin = getObservableApiOrigin(), clack}: ObservableApiClientOptions) {
     this._apiOrigin = apiOrigin;
     this._apiHeaders = {
       Accept: "application/json",
       "User-Agent": `Observable Framework ${process.env.npm_package_version}`,
       "X-Observable-Api-Version": "2023-12-06"
     };
+    this._clack = clack;
     if (apiKey) this.setApiKey(apiKey);
   }
 
@@ -47,12 +61,25 @@ export class ObservableApiClient {
 
   private async _fetch<T = unknown>(url: URL, options: RequestInit): Promise<T> {
     let response;
+    const doFetch = async () => await fetch(url, {...options, headers: {...this._apiHeaders, ...options.headers}});
     try {
-      response = await fetch(url, {...options, headers: {...this._apiHeaders, ...options.headers}});
+      response = await doFetch();
     } catch (error) {
       // Check for undici failures and print them in a way that shows more details. Helpful in tests.
       if (error instanceof Error && error.message === "fetch failed") console.error(error);
       throw error;
+    }
+
+    if (response.status === 429) {
+      // rate limit
+      if (this._rateLimit === null) {
+        let retryAfter = +response.headers.get("Retry-After");
+        if (isNaN(retryAfter) || retryAfter < MIN_RATE_LIMIT_RETRY_AFTER) retryAfter = MIN_RATE_LIMIT_RETRY_AFTER;
+        this._clack.log.warn(`Hit server rate limit. Waiting for ${retryAfter} seconds.`);
+        this._rateLimit = new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+      }
+      await this._rateLimit;
+      response = await doFetch();
     }
 
     if (!response.ok) {
@@ -62,9 +89,11 @@ export class ObservableApiClient {
       } catch (error) {
         // that's ok
       }
-      const error = new HttpError(`Unexpected response status ${JSON.stringify(response.status)}`, response.status, {
-        details
-      });
+      const error = new HttpError(
+        `Unexpected response status ${JSON.stringify(response.status)} for ${options.method ?? "GET"} ${url.href}`,
+        response.status,
+        {details}
+      );
 
       // check for version mismatch
       if (
@@ -116,14 +145,6 @@ export class ObservableApiClient {
     });
   }
 
-  async postEditProject(projectId: string, updates: PostEditProjectRequest): Promise<PostEditProjectResponse> {
-    return await this._fetch<PostEditProjectResponse>(new URL(`/cli/project/${projectId}/edit`, this._apiOrigin), {
-      method: "POST",
-      headers: {"content-type": "application/json"},
-      body: JSON.stringify({...updates})
-    });
-  }
-
   async getWorkspaceProjects(workspaceLogin: string): Promise<GetProjectResponse[]> {
     const pages = await this._fetch<PaginatedList<GetProjectResponse>>(
       new URL(`/cli/workspace/@${workspaceLogin}/projects`, this._apiOrigin),
@@ -158,14 +179,29 @@ export class ObservableApiClient {
     const blob = new Blob([contents]);
     body.append("file", blob);
     body.append("client_name", relativePath);
-    await this._fetch(url, {method: "POST", body});
+    try {
+      await this._fetch(url, {method: "POST", body});
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${error}`;
+      throw new CliError(`While uploading ${relativePath} (${formatByteSize(contents.length)}): ${message}`, {
+        cause: error
+      });
+    }
   }
 
-  async postDeployUploaded(deployId: string): Promise<DeployInfo> {
+  async postDeployManifest(deployId: string, files: DeployManifestFile[]): Promise<PostDeployManifestResponse> {
+    return await this._fetch<PostDeployManifestResponse>(new URL(`/cli/deploy/${deployId}/manifest`, this._apiOrigin), {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({files})
+    });
+  }
+
+  async postDeployUploaded(deployId: string, buildManifest: BuildManifest | null): Promise<DeployInfo> {
     return await this._fetch<DeployInfo>(new URL(`/cli/deploy/${deployId}/uploaded`, this._apiOrigin), {
       method: "POST",
       headers: {"content-type": "application/json"},
-      body: "{}"
+      body: JSON.stringify(buildManifest)
     });
   }
 
@@ -184,10 +220,6 @@ export class ObservableApiClient {
       body: JSON.stringify({id})
     });
   }
-}
-
-export interface PostEditProjectRequest {
-  title?: string;
 }
 
 export interface PostEditProjectResponse {
@@ -269,4 +301,20 @@ export interface GetDeployResponse {
   id: string;
   status: string;
   url: string;
+}
+
+export interface DeployManifestFile {
+  path: string;
+  size: number;
+  hash: string;
+}
+
+export interface PostDeployManifestResponse {
+  status: "ok" | "error";
+  detail: string | null;
+  files: {
+    path: string;
+    status: "upload" | "skip" | "error";
+    detail: string | null;
+  }[];
 }

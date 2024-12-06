@@ -1,6 +1,9 @@
 #!/usr/bin/env node
-import {type ParseArgsConfig, parseArgs} from "node:util";
+import {join} from "node:path/posix";
+import type {ParseArgsConfig} from "node:util";
+import {parseArgs} from "node:util";
 import * as clack from "@clack/prompts";
+import wrapAnsi from "wrap-ansi";
 import {readConfig} from "../config.js";
 import {CliError} from "../error.js";
 import {faint, link, red} from "../tty.js";
@@ -9,11 +12,13 @@ const args = process.argv.slice(2);
 
 const CONFIG_OPTION = {
   root: {
-    type: "string"
+    type: "string",
+    description: "Path to the project root"
   },
   config: {
     type: "string",
-    short: "c"
+    short: "c",
+    description: "Path to the app config file"
   }
 } as const;
 
@@ -71,12 +76,12 @@ try {
       helpArgs(command, {allowPositionals: true});
       console.log(
         `usage: observable <command>
-  create       create a new project from a template
+  create       create a new app from a template
   preview      start the preview server
   build        generate a static site
   login        sign-in to Observable
   logout       sign-out of Observable
-  deploy       deploy a project to Observable
+  deploy       deploy an app to Observable
   whoami       check authentication status
   convert      convert an Observable notebook to Markdown
   help         print usage information
@@ -106,55 +111,85 @@ try {
     }
     case "deploy": {
       const {
-        values: {config, root, message}
+        values: {config, root, message, build, id, "deploy-config": deployConfigPath}
       } = helpArgs(command, {
         options: {
           ...CONFIG_OPTION,
           message: {
             type: "string",
-            short: "m"
+            short: "m",
+            description: "Message to associate with this deploy"
+          },
+          build: {
+            type: "boolean",
+            description: "Always build before deploying"
+          },
+          "no-build": {
+            type: "boolean",
+            description: "Don’t build before deploying; deploy as is"
+          },
+          id: {
+            type: "string",
+            hidden: true
+          },
+          "deploy-config": {
+            type: "string",
+            description: "Path to the deploy config file (deploy.json)"
           }
         }
       });
       await import("../deploy.js").then(async (deploy) =>
-        deploy.deploy({config: await readConfig(config, root), message})
+        deploy.deploy({
+          config: await readConfig(config, root),
+          message,
+          force: build === true ? "build" : build === false ? "deploy" : null,
+          deployId: id,
+          deployConfigPath
+        })
       );
       break;
     }
     case "preview": {
-      const {values, tokens} = helpArgs(command, {
-        tokens: true,
+      const {values} = helpArgs(command, {
         options: {
           ...CONFIG_OPTION,
           host: {
             type: "string",
-            default: "127.0.0.1"
+            default: "127.0.0.1",
+            description: "the server host; use 0.0.0.0 to accept external connections"
           },
           port: {
-            type: "string"
+            type: "string",
+            description: "the server port; defaults to 3000 (or higher if unavailable)"
+          },
+          cors: {
+            type: "boolean",
+            description: "allow cross-origin requests on all origins (*)"
+          },
+          "allow-origin": {
+            type: "string",
+            multiple: true,
+            description: "allow cross-origin requests on a specific origin"
           },
           open: {
             type: "boolean",
-            default: true
+            default: true,
+            description: "open browser"
           },
           "no-open": {
             type: "boolean"
           }
         }
       });
-      // https://nodejs.org/api/util.html#parseargs-tokens
-      for (const token of tokens) {
-        if (token.kind !== "option") continue;
-        const {name} = token;
-        if (name === "no-open") values.open = false;
-        else if (name === "open") values.open = true;
-      }
-      const {config, root, host, port, open} = values;
+      const {config, root, host, port, open, cors, ["allow-origin"]: origins} = values;
+      await readConfig(config, root); // Ensure the config is valid.
       await import("../preview.js").then(async (preview) =>
         preview.preview({
-          config: await readConfig(config, root),
+          config,
+          root,
           hostname: host!,
           port: port === undefined ? undefined : +port,
+          origins: cors ? ["*"] : origins,
           open
         })
       );
@@ -178,12 +213,27 @@ try {
     case "convert": {
       const {
         positionals,
-        values: {output, force}
+        values: {config, root, output: out, force}
       } = helpArgs(command, {
-        options: {output: {type: "string", default: "."}, force: {type: "boolean", short: "f"}},
+        options: {
+          output: {
+            type: "string",
+            short: "o",
+            description: "Output directory (defaults to the source root)"
+          },
+          force: {
+            type: "boolean",
+            short: "f",
+            description: "If true, overwrite existing resources"
+          },
+          ...CONFIG_OPTION
+        },
         allowPositionals: true
       });
-      await import("../convert.js").then((convert) => convert.convert(positionals, {output: output!, force}));
+      // The --output command-line option is relative to the cwd, but the root
+      // config option (typically "src") is relative to the project root.
+      const output = out ?? join(root ?? ".", (await readConfig(config, root)).root);
+      await import("../convert.js").then((convert) => convert.convert(positionals, {output, force}));
       break;
     }
     default: {
@@ -193,29 +243,37 @@ try {
     }
   }
 } catch (error: any) {
+  const wrapWidth = Math.min(80, process.stdout.columns ?? 80);
+  const bugMessage = "If you think this is a bug, please file an issue at";
+  const bugUrl = "https://github.com/observablehq/framework/issues";
+  const clackBugMessage = () => {
+    // clack.outro doesn't handle multiple lines well, so do it manually
+    console.log(`${faint("│\n│")}  ${bugMessage}\n${faint("└")}  ${link(bugUrl)}\n`);
+  };
+  const consoleBugMessage = () => {
+    console.error(`${bugMessage}\n↳ ${link(bugUrl)}\n`);
+  };
+
   if (error instanceof CliError) {
     if (error.print) {
       if (command && CLACKIFIED_COMMANDS.includes(command)) {
-        clack.outro(red(`Error: ${error.message}`));
+        clack.log.error(wrapAnsi(red(`Error: ${error.message}`), wrapWidth));
+        clackBugMessage();
       } else {
         console.error(red(error.message));
+        consoleBugMessage();
       }
     }
     process.exit(error.exitCode);
   } else {
     if (command && CLACKIFIED_COMMANDS.includes(command)) {
-      clack.log.error(`${red("Error:")} ${error.message}`);
+      clack.log.error(wrapAnsi(`${red("Error:")} ${error.message}`, wrapWidth));
       if (values.debug) {
         clack.outro("The full error follows");
         throw error;
       } else {
         clack.log.info("To see the full stack trace, run with the --debug flag.");
-        // clack.outro doesn't handle multiple lines well, so do it manually
-        console.log(
-          `${faint("│\n│")}  If you think this is a bug, please file an issue at\n${faint("└")}  ${link(
-            "https://github.com/observablehq/framework/issues\n"
-          )}`
-        );
+        clackBugMessage();
       }
     } else {
       console.error(`\n${red("Unexpected error:")} ${error.message}`);
@@ -224,26 +282,49 @@ try {
         throw error;
       } else {
         console.error("\nTip: To see the full stack trace, run with the --debug flag.\n");
-        console.error(
-          `If you think this is a bug, please file an issue at\n↳ ${link(
-            "https://github.com/observablehq/framework/issues\n"
-          )}`
-        );
+        consoleBugMessage();
       }
     }
   }
   process.exit(1);
 }
 
+type DescribableParseArgsConfig = ParseArgsConfig & {
+  options?: {
+    [longOption: string]: {
+      type: "string" | "boolean";
+      multiple?: boolean | undefined;
+      short?: string | undefined;
+      default?: string | boolean | string[] | boolean[] | undefined;
+      description?: string;
+      hidden?: boolean;
+    };
+  };
+};
+
 // A wrapper for parseArgs that adds --help functionality with automatic usage.
 // TODO It’d be nicer nice if we could change the return type to denote
 // arguments with default values, and to enforce required arguments, if any.
-function helpArgs<T extends ParseArgsConfig>(command: string | undefined, config: T): ReturnType<typeof parseArgs<T>> {
+function helpArgs<T extends DescribableParseArgsConfig>(
+  command: string | undefined,
+  config: T
+): ReturnType<typeof parseArgs<T>> {
+  const {options = {}} = config;
+
+  // Find the boolean --foo options that have a corresponding boolean --no-foo.
+  const booleanPairs: string[] = [];
+  for (const key in options) {
+    if (options[key].type === "boolean" && !key.startsWith("no-") && options[`no-${key}`]?.type === "boolean") {
+      booleanPairs.push(key);
+    }
+  }
+
   let result: ReturnType<typeof parseArgs<T>>;
   try {
     result = parseArgs<T>({
       ...config,
-      options: {...config.options, help: {type: "boolean", short: "h"}, debug: {type: "boolean"}},
+      tokens: config.tokens || booleanPairs.length > 0,
+      options: {...options, help: {type: "boolean", short: "h"}, debug: {type: "boolean"}},
       args
     });
   } catch (error: any) {
@@ -251,15 +332,44 @@ function helpArgs<T extends ParseArgsConfig>(command: string | undefined, config
     console.error(`observable: ${error.message}. See 'observable help${command ? ` ${command}` : ""}'.`);
     process.exit(1);
   }
+
+  // Log automatic help.
   if ((result.values as any).help) {
+    // Omit hidden flags from help.
+    const publicOptions = Object.fromEntries(Object.entries(options).filter(([, option]) => !option.hidden));
     console.log(
       `Usage: observable ${command}${command === undefined || command === "help" ? " <command>" : ""}${Object.entries(
-        config.options ?? {}
+        publicOptions
       )
         .map(([name, {default: def}]) => ` [--${name}${def === undefined ? "" : `=${def}`}]`)
         .join("")}`
     );
+    if (Object.values(publicOptions).some((spec) => spec.description)) {
+      console.log();
+      for (const [long, spec] of Object.entries(publicOptions)) {
+        if (spec.description) {
+          const left = `  ${spec.short ? `-${spec.short}, ` : ""}--${long}`.padEnd(20);
+          console.log(`${left}${spec.description}`);
+        }
+      }
+      console.log();
+    }
     process.exit(0);
   }
+
+  // Merge --no-foo into --foo based on order
+  // https://nodejs.org/api/util.html#parseargs-tokens
+  if ("tokens" in result && result.tokens) {
+    const {values, tokens} = result;
+    for (const key of booleanPairs) {
+      for (const token of tokens) {
+        if (token.kind !== "option") continue;
+        const {name} = token;
+        if (name === `no-${key}`) values[key] = false;
+        else if (name === key) values[key] = true;
+      }
+    }
+  }
+
   return result;
 }

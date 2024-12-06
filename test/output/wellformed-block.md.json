@@ -1,6 +1,7 @@
 {
-  "data": null,
+  "data": {},
   "title": "Well-formed block",
   "style": null,
-  "code": []
+  "code": [],
+  "path": "wellformed-block.md"
 }

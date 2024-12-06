@@ -1,6 +1,7 @@
 {
-  "data": null,
+  "data": {},
   "title": "Hello, world!",
   "style": null,
-  "code": []
+  "code": [],
+  "path": "hello-world.md"
 }

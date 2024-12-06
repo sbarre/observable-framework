@@ -1,3 +1,4 @@
+/* global DUCKDB_MANIFEST */
 import * as duckdb from "npm:@duckdb/duckdb-wasm";
 
 // Adapted from https://observablehq.com/@cmudig/duckdb-client
@@ -29,17 +30,21 @@ import * as duckdb from "npm:@duckdb/duckdb-wasm";
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-const bundle = await duckdb.selectBundle({
-  mvp: {
-    mainModule: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm"),
-    mainWorker: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js")
-  },
-  eh: {
-    mainModule: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-eh.wasm"),
-    mainWorker: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js")
-  }
-});
-
+const bundles = {
+  mvp: DUCKDB_MANIFEST.platforms.mvp
+    ? {
+        mainModule: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm"),
+        mainWorker: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js")
+      }
+    : undefined,
+  eh: DUCKDB_MANIFEST.platforms.eh
+    ? {
+        mainModule: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-eh.wasm"),
+        mainWorker: import.meta.resolve("npm:@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js")
+      }
+    : undefined
+};
+const bundle = duckdb.selectBundle(bundles);
 const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
 
 let db;
@@ -115,9 +120,8 @@ export class DuckDBClient {
       } else {
         table = await connection.query(query);
       }
-    } catch (error) {
+    } finally {
       await connection.close();
-      throw error;
     }
     return table;
   }
@@ -170,42 +174,64 @@ export class DuckDBClient {
       config = {...config, query: {...config.query, castBigIntToDouble: true}};
     }
     await db.open(config);
+    await registerExtensions(db, config.extensions);
     await Promise.all(Object.entries(sources).map(([name, source]) => insertSource(db, name, source)));
     return new DuckDBClient(db);
   }
+
+  static sql() {
+    return this.of.apply(this, arguments).then((db) => db.sql.bind(db));
+  }
 }
 
-Object.defineProperty(DuckDBClient.prototype, "dialect", {
-  value: "duckdb"
-});
+Object.defineProperty(DuckDBClient.prototype, "dialect", {value: "duckdb"});
+
+async function registerExtensions(db, extensions) {
+  const {mainModule} = await bundle;
+  const platform = Object.keys(bundles).find((platform) => mainModule === bundles[platform].mainModule);
+  const con = await db.connect();
+  try {
+    await Promise.all(
+      Object.entries(DUCKDB_MANIFEST.extensions).map(([name, {load, [platform]: ref}]) =>
+        con
+          .query(`INSTALL "${name}" FROM '${import.meta.resolve(ref)}'`)
+          .then(() => (extensions === undefined ? load : extensions.includes(name)) && con.query(`LOAD "${name}"`))
+      )
+    );
+  } finally {
+    await con.close();
+  }
+}
 
 async function insertSource(database, name, source) {
   source = await source;
-  if (isFileAttachment(source)) {
-    // bare file
-    await insertFile(database, name, source);
-  } else if (isArrowTable(source)) {
-    // bare arrow table
-    await insertArrowTable(database, name, source);
-  } else if (Array.isArray(source)) {
-    // bare array of objects
-    await insertArray(database, name, source);
-  } else if (isArqueroTable(source)) {
-    await insertArqueroTable(database, name, source);
-  } else if ("data" in source) {
-    // data + options
-    const {data, ...options} = source;
-    if (isArrowTable(data)) {
-      await insertArrowTable(database, name, data, options);
-    } else {
-      await insertArray(database, name, data, options);
+  if (isFileAttachment(source)) return insertFile(database, name, source);
+  if (isArrowTable(source)) return insertArrowTable(database, name, source);
+  if (Array.isArray(source)) return insertArray(database, name, source);
+  if (isArqueroTable(source)) return insertArqueroTable(database, name, source);
+  if (typeof source === "string") return insertUrl(database, name, source);
+  if (source && typeof source === "object") {
+    if ("data" in source) {
+      // data + options
+      const {data, ...options} = source;
+      if (isArrowTable(data)) return insertArrowTable(database, name, data, options);
+      return insertArray(database, name, data, options);
     }
-  } else if ("file" in source) {
-    // file + options
-    const {file, ...options} = source;
-    await insertFile(database, name, file, options);
-  } else {
-    throw new Error(`invalid source: ${source}`);
+    if ("file" in source) {
+      // file + options
+      const {file, ...options} = source;
+      return insertFile(database, name, file, options);
+    }
+  }
+  throw new Error(`invalid source: ${source}`);
+}
+
+async function insertUrl(database, name, url) {
+  const connection = await database.connect();
+  try {
+    await connection.query(`CREATE VIEW '${name}' AS FROM '${url}'`);
+  } finally {
+    await connection.close();
   }
 }
 
@@ -253,7 +279,11 @@ async function insertFile(database, name, file, options) {
           });
         }
         if (/\.parquet$/i.test(file.name)) {
-          return await connection.query(`CREATE VIEW '${name}' AS SELECT * FROM parquet_scan('${file.name}')`);
+          const table = file.size < 50e6 ? "TABLE" : "VIEW"; // for small files, materialize the table
+          return await connection.query(`CREATE ${table} '${name}' AS SELECT * FROM parquet_scan('${file.name}')`);
+        }
+        if (/\.(db|ddb|duckdb)$/i.test(file.name)) {
+          return await connection.query(`ATTACH '${file.name}' AS ${name} (READ_ONLY)`);
         }
         throw new Error(`unknown file type: ${file.mimeType}`);
     }
@@ -297,9 +327,10 @@ async function insertArray(database, name, array, options) {
 }
 
 async function createDuckDB() {
-  const worker = await duckdb.createWorker(bundle.mainWorker);
+  const {mainWorker, mainModule} = await bundle;
+  const worker = await duckdb.createWorker(mainWorker);
   const db = new duckdb.AsyncDuckDB(logger, worker);
-  await db.instantiate(bundle.mainModule);
+  await db.instantiate(mainModule);
   return db;
 }
 

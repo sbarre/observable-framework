@@ -1,16 +1,19 @@
 import assert from "node:assert";
-import {isPathImport, relativePath, resolveLocalPath, resolvePath} from "../src/path.js";
+import {isPathImport, parseRelativeUrl, relativePath, resolveLocalPath, resolvePath, within} from "../src/path.js";
 
 describe("resolvePath(source, target)", () => {
   it("returns the path to the specified target within the source root", () => {
     assert.strictEqual(resolvePath("foo", "baz"), "/baz");
+    assert.strictEqual(resolvePath("foo", "./"), "/");
     assert.strictEqual(resolvePath("./foo", "./baz"), "/baz");
     assert.strictEqual(resolvePath("/foo", "baz"), "/baz");
     assert.strictEqual(resolvePath("/foo", "./baz"), "/baz");
     assert.strictEqual(resolvePath("foo/bar", "baz"), "/foo/baz");
+    assert.strictEqual(resolvePath("foo/bar", "./"), "/foo/");
     assert.strictEqual(resolvePath("./foo/bar", "./baz"), "/foo/baz");
     assert.strictEqual(resolvePath("/foo/bar", "baz"), "/foo/baz");
     assert.strictEqual(resolvePath("/foo/bar", "./baz"), "/foo/baz");
+    assert.strictEqual(resolvePath("/foo/bar", "../"), "/");
   });
   it("allows paths outside the root", () => {
     assert.strictEqual(resolvePath("foo", "../baz"), "../baz");
@@ -125,5 +128,44 @@ describe("isPathImport(specifier)", () => {
     assert.strictEqual(isPathImport("foo"), false);
     assert.strictEqual(isPathImport("foo:bar"), false);
     assert.strictEqual(isPathImport("foo://bar"), false);
+  });
+});
+
+describe("parseRelativeUrl(url)", () => {
+  it("handles paths", () => {
+    assert.deepStrictEqual(parseRelativeUrl("foo"), {pathname: "foo", search: "", hash: ""});
+    assert.deepStrictEqual(parseRelativeUrl("foo.html"), {pathname: "foo.html", search: "", hash: ""});
+    assert.deepStrictEqual(parseRelativeUrl("../foo"), {pathname: "../foo", search: "", hash: ""});
+    assert.deepStrictEqual(parseRelativeUrl("./foo"), {pathname: "./foo", search: "", hash: ""});
+    assert.deepStrictEqual(parseRelativeUrl("/foo"), {pathname: "/foo", search: "", hash: ""});
+    assert.deepStrictEqual(parseRelativeUrl("/foo%3Fbar"), {pathname: "/foo%3Fbar", search: "", hash: ""});
+  });
+  it("handles queries", () => {
+    assert.deepStrictEqual(parseRelativeUrl("foo?bar"), {pathname: "foo", search: "?bar", hash: ""});
+  });
+  it("handles hashes", () => {
+    assert.deepStrictEqual(parseRelativeUrl("foo#bar"), {pathname: "foo", search: "", hash: "#bar"});
+    assert.deepStrictEqual(parseRelativeUrl("foo#bar?baz"), {pathname: "foo", search: "", hash: "#bar?baz"});
+  });
+  it("handles queries and hashes", () => {
+    assert.deepStrictEqual(parseRelativeUrl("foo?bar#baz"), {pathname: "foo", search: "?bar", hash: "#baz"});
+  });
+});
+
+describe("within(root, path)", () => {
+  it("returns true for paths within the current working directory", () => {
+    assert.strictEqual(within(process.cwd(), "dist"), true, "dist");
+    assert.strictEqual(within(process.cwd(), "./dist"), true, "./dist");
+    assert.strictEqual(within(process.cwd(), "dist/"), true, "dist/");
+    assert.strictEqual(within(process.cwd(), "./dist/"), true, "./dist/");
+    assert.strictEqual(within(process.cwd(), "foo/../dist"), true, "foo/../dist");
+    assert.strictEqual(within(process.cwd(), "foo/../dist/"), true, "foo/../dist/");
+    assert.strictEqual(within(process.cwd(), "./foo/../dist/"), true, "./foo/../dist/");
+    assert.strictEqual(within(process.cwd(), "foo/bar"), true, "foo/bar");
+    assert.strictEqual(within(process.cwd(), "foo/bar"), true, "foo/bar");
+    assert.strictEqual(within(process.cwd(), "../framework/dist"), true, "../framework/dist");
+    assert.strictEqual(within(process.cwd(), "../framework2/dist"), false, "../framework2/dist");
+    assert.strictEqual(within(process.cwd(), "../dist"), false, "../dist");
+    assert.strictEqual(within(process.cwd(), "/dist"), false, "/dist");
   });
 });
